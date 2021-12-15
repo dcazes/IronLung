@@ -1,0 +1,345 @@
+#from numpy.core.fromnumeric import mean, shape
+import pandas as pd
+import glob
+import os
+#import tensorflow as tf
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
+import tensorflow.keras as ks
+import numpy as np
+from PIL import Image
+import datetime
+from numba import jit, cuda
+from keras.utils.vis_utils import plot_model
+#from tensorflow.keras.backend import clear_session
+#from keras import metrics, losses
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import multilabel_confusion_matrix as cfm
+from sklearn.metrics import classification_report as clfr
+#from sklearn import preprocessing
+from talos import Scan
+##from tensorflow.python.keras.backend import flatten
+
+
+def import_imgs():
+    fps = []
+    fns = []
+    imgs = []
+
+    data_dirs = [name for name in os.listdir('Data')]
+    print("Case Directories Found: ", data_dirs)
+    for dir in data_dirs:
+        input_dir = os.path.join('Data', dir, 'images')
+        print("Searching for images in: ", input_dir)
+
+        # Find all JPG  in case filepaths
+        for file in glob.glob(os.path.join(input_dir, "*.png")):
+            fps.append(file)
+        print("Number of files found: ", len(fps), " in folder ", input_dir)
+
+        # Load all found filepaths
+        for file in fps:
+            with Image.open(file) as f:
+                f.thumbnail((512, 512))
+                imgs.append(f.convert('L'))
+                if (len(imgs) % 1000 == 0):
+                    print(len(imgs), " Images Converted")
+            fns.append(file)
+        print("Number of Images found: ", len(imgs))
+    return imgs, fns
+
+
+# Function that produces label arrays from images
+def label_data(csv_path, imgs, fns):
+    labels = pd.read_csv(csv_path, keep_default_na=False)
+    #ord_labs = labels.dropna()
+    #print("Num Imgs", len(imgs))
+    labs = pd.DataFrame(columns=['Image Index', "Finding Labels"])
+
+    for fn in fns:
+        fn = [fn[fn.rfind('\\') + 1:]]
+        labs = labs.append(labels[labels['Image Index'].isin(fn)])
+    
+    labs.reset_index(drop = True, inplace=True)
+    #print (labs.shape[0])
+    #print(labs)
+    for i in range(labs.shape[0]-1, 0, -1):
+
+        if (labs.iloc[i, 1] == "No Finding"):
+            del imgs[i]
+            labs = labs.drop(i)
+    #print (labs.shape[0])
+    labs.reset_index(drop = True, inplace=True)
+    #print(labs)
+    return labs, imgs
+
+# Function that defines the mode
+def encoder(labels, fp):
+    findings = [
+        "Image Index", "Cardiomegaly", "Hernia", "Mass", "Infiltration",
+        "Effusion", "Nodule", "Emphysema", "Atelectasis", "Pleural_Thickening",
+        "Pneumothorax", "Fibrosis", "Consolidation", "Edema", "Pneumonia"
+    ]
+    init_arr = np.zeros((labels.shape[0], len(findings)))
+    enc_labs = pd.DataFrame(init_arr, columns=findings)
+
+    for finding in findings:
+        for ind, row in labels.iterrows():
+            enc_labs['Image Index'][ind] = row['Image Index']
+            if finding in row['Finding Labels']:
+                enc_labs[finding][ind] = int(1)
+            else:
+                enc_labs[finding][ind] = int(0)
+    
+    enc_labs.set_index('Image Index', inplace=True)
+    print("Labels Successfully Encoded")
+    enc_labs.to_csv(os.path.join(fp, "labels.csv"))
+    return enc_labs
+
+
+def byte_map(nor_imgs):
+    input_data = []
+    for i in range(len(nor_imgs)):
+        input_data.append(np.array(nor_imgs[i]))
+        if (i % 1000 == 0):
+            print((i * 100) / len(nor_imgs), "% Images Converted")
+
+    input_data = np.expand_dims(np.array(input_data), axis=3)
+    return input_data
+
+
+@jit
+def load_model(x_train, y_train, x_val, y_val, h_pars):
+
+    time_stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    dir_path = os.path.join(h_pars['exp_dir'], time_stamp)
+    os.mkdir(dir_path)
+    inputs = ks.Input(shape=(512, 512, 1))
+    
+    outputs = ks.layers.MaxPooling2D(
+        (h_pars['pooling_size'], h_pars['pooling_size']))(inputs)
+    outputs = ks.layers.BatchNormalization()(outputs)
+    outputs = ks.layers.Conv2D(filters=h_pars['filters_1'],
+                               kernel_size=h_pars['kernel_1'],
+                               strides=h_pars['strides'],
+                               padding=h_pars['padding'])(outputs)
+    outputs = ks.layers.LeakyReLU(alpha=h_pars['alpha'])(outputs)
+    
+    outputs = ks.layers.MaxPooling2D(
+        (h_pars['pooling_size'], h_pars['pooling_size']))(outputs)
+    outputs = ks.layers.BatchNormalization()(outputs)
+    outputs = ks.layers.Conv2D(filters=h_pars['filters_2'],
+                               kernel_size=h_pars['kernel_2'],
+                               strides=h_pars['strides'],
+                               padding=h_pars['padding'])(outputs)
+    outputs = ks.layers.LeakyReLU(alpha=h_pars['alpha'])(outputs)
+
+    outputs = ks.layers.MaxPooling2D(
+        (h_pars['pooling_size'], h_pars['pooling_size']))(outputs)
+    outputs = ks.layers.BatchNormalization()(outputs)
+    outputs = ks.layers.Conv2D(filters=h_pars['filters_3'],
+                               kernel_size=h_pars['kernel_3'],
+                               strides=h_pars['strides'],
+                               padding=h_pars['padding'])(outputs)
+    outputs = ks.layers.LeakyReLU(alpha=h_pars['alpha'])(outputs)    
+
+    outputs = ks.layers.Flatten()(outputs)
+    outputs = ks.layers.Dropout(h_pars['dropout'])(outputs)
+    outputs = ks.layers.Dense(units=h_pars['dense_units'])(outputs)
+    #outputs = ks.layers.LeakyReLU(alpha=h_pars['alpha'])(outputs)
+    outputs = ks.layers.Dropout(h_pars['dropout'])(outputs)
+    outputs = ks.layers.Dense(units=14, activation='sigmoid')(outputs)
+    outputs = ks.layers.Flatten()(outputs)
+
+    model = ks.Model(inputs=[inputs], outputs=[outputs])
+
+    # Compile and train model
+    model.compile(optimizer="adam",
+                  loss='binary_crossentropy',
+                  metrics=['binary_crossentropy', 'binary_accuracy'])
+
+    plot_model(model,
+               to_file=os.path.join(dir_path, 'model_struct.png'),
+               show_shapes=True,
+               show_layer_names=True)
+
+    hist = model.fit(x=x_train,
+                     y=y_train,
+                     validation_split=0.2,
+                     epochs=3,
+                     batch_size=h_pars['batch_size'])
+
+    # Save model figure
+
+    # Test model predictions
+    evaluate_model(dir_path, model, x_val, y_val)
+
+    # Save hyper-parameters used in the run
+    hpar_file = pd.DataFrame([['filt1', h_pars['filters_1']],
+                              ['filt2', h_pars['filters_2']],
+                              ['filt3', h_pars['filters_3']],
+                              ['kern1', h_pars['kernel_1']],
+                              ['kern2', h_pars['kernel_2']],
+                              ['kern3', h_pars['kernel_3']],
+                              ['strides', h_pars['strides']],
+                              ['dropout', h_pars['dropout']],
+                              ['pooling_size', h_pars['pooling_size']],
+                              ['dense_units', h_pars['dense_units']],
+                              ['alpha', h_pars['alpha']],
+                              ['batch_size', h_pars['batch_size']],
+                              ['padding', h_pars['padding']]])
+
+    hpar_file.to_csv(os.path.join(dir_path, 'hyper_params.csv'))
+    #clear_session()
+    return hist, model
+
+
+def talos_scan(x_train, y_train, h_pars, load_model, experiment_dir, x_val,
+               y_val):
+    h = Scan(
+        x=x_train,
+        y=y_train,
+        params=h_pars,
+        model=load_model,
+        experiment_name=experiment_dir,
+        x_val=x_val,
+        y_val=y_val,
+        print_params=True,
+        clear_session=True,
+        round_limit=1,
+    )
+    cuda.profile_stop()
+    return h
+
+"""              reduction_method='correlation',
+             reduction_interval=5,
+             reduction_window=5,
+             reduction_threshold=0.2,
+             reduction_metric='mae',
+             minimize_loss=True """
+
+# calculate and record metrics from model evaluation
+
+
+def evaluate_model(exp_dir, model, eval_imgs, labels):
+
+    preds = pd.DataFrame(model.predict(eval_imgs, verbose=1))
+    print("Preds: ", preds)
+
+    for i in np.arange(1, 9, 1):
+        ii = i / 10
+        thresh = np.where(preds > ii, 1, 0)
+        print("Thresh: ", thresh)
+
+        #i = "{:.1f}".format(ii)
+
+        cfm_out = cfm(labels, thresh)
+        print("CFM: ", cfm_out[0, 0])
+
+        rep = clfr(labels, thresh)
+
+        accuracy = []
+        precision = []
+        recall = []
+        for iii in cfm_out:
+            tn = iii[0, 0]
+            fp = iii[0, 1]
+            fn = iii[1, 0]
+            tp = iii[1, 1]
+
+            accuracy.append([(tp + tn) / (tp + fp + tn + fn)])
+            precision.append([(tp / (tp + fp))])
+            recall.append([(tp / (tp + fn))])
+
+        pd.DataFrame([accuracy, precision, recall, cfm_out, rep]).to_csv(
+            os.path.join(exp_dir, 'confusion_matrix{}.csv'.format(i)))
+
+
+def read_csv(fp, index_col=None):
+    return pd.read_csv(fp, index_col=index_col)
+
+
+#####################################################
+#                                                   #
+#       Authors: Daniel Cazes                       #
+#       Last Updated: Dec 1, 2021                   #
+#       Function: Classify CXR Using CNN            #
+#                                                   #
+#####################################################
+
+# Initialize Variables
+timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+input_dir = "Data"
+csv_path = os.path.join("Metadata", "Data_Entry_2017.csv")
+experiment_dir = os.path.join("output", timestamp)
+output_dirs = ["Model_Details", "Model_Results"]
+
+# Final Hyper-Parameter Search Space Selection
+h_pars = {
+    'filters_1': [5],
+    'filters_2': [10],
+    'filters_3': [15],
+    'kernel_1': [25],
+    'kernel_2': [15],
+    'kernel_3': [5],
+    'strides': [1],
+    'dense_units': [512],
+    'pooling_size': [3],
+    'dropout': [0.3],
+    'alpha': [0.3],
+    'batch_size': [90],
+    'padding': ['valid'],
+    'exp_dir': [experiment_dir]
+}
+
+#Original Hyper Parameter Search Space
+# 'filters_1': [5, 10, 15],
+#           'filters_2': [15, 20, 25],
+#           'filters_3': [25, 35, 40],
+#           'kernel_1': [25, 31, 35],
+#           'kernel_2': [13, 19, 25],
+#           'kernel_3': [3, 5, 7]
+
+# Create Experiment Folder
+os.mkdir(experiment_dir)
+nor_imgs, filenames = import_imgs()
+
+# Label the data using CSV
+print("Experiment Dir:", experiment_dir)
+ordered_labels, fin_imgs = label_data(csv_path, nor_imgs, filenames)
+
+#nor_imgs = match_labels(ordered_labels, nor_imgs, filenames)
+
+encoded_labels = encoder(ordered_labels, experiment_dir)
+#print ("Labels", encoded_labels.shape)
+#print ("Imgs", len(nor_imgs))
+#input_data = np.empty([1024, 1024])
+print("Converting Images to Byte-Map")
+input_data = byte_map(fin_imgs)
+
+img_shape = input_data[0]
+x_train, x_val, y_train, y_val = train_test_split(input_data,
+                                                  encoded_labels,
+                                                  test_size=0.2)
+
+#x_train = np.array(x_train)
+y_train = np.array(y_train)
+#x_val = np.array(x_val)
+y_test = np.array(y_val)
+
+print("Number of Samples in Training:", len(x_train))
+print("Number of Samples in Testing:", len(x_val))
+
+# this function runs the experiment multiple times wiuth different hyper-parameters
+print("Training in Progress")
+
+h = talos_scan(x_train, y_train, h_pars, load_model, experiment_dir, x_val,
+               y_val)
+# save files
+all_filenames = [
+    i for i in glob.glob(
+        os.path.join(experiment_dir, '*', 'confusion_matrix*.csv'))
+]
+combined_csv = pd.concat([pd.read_csv(f) for f in all_filenames])
+combined_csv.to_csv(os.path.join(experiment_dir, 'combined_metrics.csv'))
+
+print("Script Completed Successfully")
